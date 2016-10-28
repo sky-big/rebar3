@@ -1,0 +1,395 @@
+%% -*- erlang-indent-level: 4;indent-tabs-mode: nil -*-
+%% ex: ts=4 sw=4 et
+%% -------------------------------------------------------------------
+%%
+%% rebar: Erlang Build Tools
+%%
+%% Copyright (c) 2009 Dave Smith (dizzyd@dizzyd.com)
+%%
+%% Permission is hereby granted, free of charge, to any person obtaining a copy
+%% of this software and associated documentation files (the "Software"), to deal
+%% in the Software without restriction, including without limitation the rights
+%% to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+%% copies of the Software, and to permit persons to whom the Software is
+%% furnished to do so, subject to the following conditions:
+%%
+%% The above copyright notice and this permission notice shall be included in
+%% all copies or substantial portions of the Software.
+%%
+%% THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+%% IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+%% FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+%% AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+%% LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+%% OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+%% THE SOFTWARE.
+%% -------------------------------------------------------------------
+-module(rebar3).
+
+-export([main/0,
+         main/1,
+         run/1,
+         run/2,
+         global_option_spec_list/0,
+         init_config/0,
+         set_options/2,
+         parse_args/1,
+         version/0,
+         log_level/0]).
+
+-include("rebar.hrl").
+
+%% ====================================================================
+%% Public API
+%% ====================================================================
+
+%% For running with:
+%% erl +sbtu +A0 -noinput -mode minimal -boot start_clean -s rebar3 main -extra "$@"
+-spec main() -> no_return().
+%% rebar3脚本入口函数
+main() ->
+    List = init:get_plain_arguments(),
+    main(List).
+
+%% escript Entry point
+-spec main(list()) -> no_return().
+%% rebar3脚本入口函数
+main(Args) ->
+    try run(Args) of
+        {ok, _State} ->
+            erlang:halt(0);
+        Error ->
+            handle_error(Error)
+    catch
+        _:Error ->
+            handle_error(Error)
+    end.
+
+%% Erlang-API entry point
+%% 支持传入rebar_state数据结构然后执行命令的接口
+run(BaseState, Commands) ->
+    start_and_load_apps(api),
+    BaseState1 = rebar_state:set(BaseState, task, Commands),
+    BaseState2 = rebar_state:set(BaseState1, caller, api),
+
+    Verbosity = log_level(),
+    ok = rebar_log:init(api, Verbosity),
+
+    run_aux(BaseState2, Commands).
+
+%% ====================================================================
+%% Internal functions
+%% ====================================================================
+
+run(RawArgs) ->
+	%% 加载相应的应用
+    start_and_load_apps(command_line),
+
+	%% 初始化配置数据，即从配置文件中读取出配置信息
+    BaseState = init_config(),
+	%% 设置caller
+    BaseState1 = rebar_state:set(BaseState, caller, command_line),
+
+	%% 判断当前ERTS的版本，如果是6.1则打印警告信息，该版本有一个bug
+    case erlang:system_info(version) of
+        "6.1" ->
+            ?WARN("Due to a filelib bug in Erlang 17.1 it is recommended"
+                 "you update to a newer release.", []);
+        _ ->
+            ok
+    end,
+
+    {BaseState2, _Args1} = set_options(BaseState1, {[], []}),
+    run_aux(BaseState2, RawArgs).
+
+run_aux(State, RawArgs) ->
+	%% 合并PROFILE配置信息(会将对应的profile配置信息合并到opts字段中)
+    State1 = case os:getenv("REBAR_PROFILE") of
+                 false ->
+                     State;
+                 "" ->
+                     State;
+                 Profile ->
+                     rebar_state:apply_profiles(State, [list_to_atom(Profile)])
+             end,
+
+	%% 检查配置信息中最小的OTP版本是否满足
+    rebar_utils:check_min_otp_version(rebar_state:get(State1, minimum_otp_vsn, undefined)),
+	%% 检查是否是列入黑名单的OTP版本
+    rebar_utils:check_blacklisted_otp_versions(rebar_state:get(State1, blacklisted_otp_vsns, undefined)),
+
+    State2 = case os:getenv("HEX_CDN") of
+                 false ->
+                     State1;
+                 CDN ->
+                     rebar_state:set(State1, rebar_packages_cdn, CDN)
+             end,
+
+    %% bootstrap test profile
+	%% 增加test这个profile测试特性
+	%% 增加新的profile(只是增加对应Profile的配置信息，不会合并到opts字段中)
+    State3 = rebar_state:add_to_profile(State2, test, test_state(State1)),
+
+    %% Process each command, resetting any state between each one
+	%% 设置基础的目录为当前目录对应的_build目录下
+    BaseDir = rebar_state:get(State, base_dir, ?DEFAULT_BASE_DIR),
+    State4 = rebar_state:set(State3, base_dir,
+                             filename:join(filename:absname(rebar_state:dir(State3)), BaseDir)),
+
+	%% 从rebar.app配置文件中providers对应的信息
+    {ok, Providers} = application:get_env(rebar, providers),
+    %% Providers can modify profiles stored in opts, so set default after initializing providers
+	%% 根据配置的providers模块名字进行初始化，得到每个模块对应的provider数据结构数据
+    State5 = rebar_state:create_logic_providers(Providers, State4),
+    %% Initializing project_plugins which can override default providers
+    State6 = rebar_plugins:project_plugins_install(State5),
+    State7 = rebar_plugins:top_level_install(State6),
+    State8 = case os:getenv("REBAR_CACHE_DIR") of
+                false ->
+                    State7;
+                ConfigFile ->
+                    rebar_state:set(State7, global_rebar_dir, ConfigFile)
+            end,
+
+    State9 = rebar_state:default(State8, rebar_state:opts(State8)),
+
+    {Task, Args} = parse_args(RawArgs),
+
+	%% 设置默认的代码搜索路径
+    State10 = rebar_state:code_paths(State9, default, code:get_path()),
+
+    rebar_core:init_command(rebar_state:command_args(State10, Args), Task).
+
+%% 初始化配置数据，即从配置文件中读取出配置信息
+init_config() ->
+    %% Initialize logging system
+	%% 获得日志等级
+    Verbosity = log_level(),
+	%% 初始化日志系统，用来根据日志等级打印相关信息
+    ok = rebar_log:init(command_line, Verbosity),
+
+	%% 打开rebar.config文件
+    Config = case os:getenv("REBAR_CONFIG") of
+                 false ->
+					 %% 默认是使用当前目录下的rebar.config
+                     rebar_config:consult_file(?DEFAULT_CONFIG_FILE);
+                 ConfigFile ->
+                     rebar_config:consult_file(ConfigFile)
+             end,
+	%% 读取rebar.lock文件，同时将rebar.lock文件和rebar.config文件中的配置信息进行合并
+    Config1 = rebar_config:merge_locks(Config, rebar_config:consult_lock_file(?LOCK_FILE)),
+
+    %% If $HOME/.config/rebar3/rebar.config exists load and use as global config
+	%% 得到全局rebar.config文件的路径
+    GlobalConfigFile = rebar_dir:global_config(),
+	%% 根据rebar.config和rebar.lock文件中的信息包括全局的rebar.config文件中的信息创建rebar_state模块中的状态数据结构
+    State = case filelib:is_regular(GlobalConfigFile) of
+                true ->
+					%% genuine全局rebar.config文件和Config数据组装rebar_state数据结构
+                    ?DEBUG("Load global config file ~s", [GlobalConfigFile]),
+                    try state_from_global_config(Config1, GlobalConfigFile)
+                    catch
+                        _:_ ->
+                            ?WARN("Global config ~s exists but can not be read. Ignoring global config values.", [GlobalConfigFile]),
+                            rebar_state:new(Config1)
+                    end;
+                false ->
+					%% 如果没有全局的rebar.config文件，则根据当前目录的rebar.config文件数据创建rebar_state数据结构
+                    rebar_state:new(Config1)
+            end,
+
+    %% Determine the location of the rebar executable; important for pulling
+    %% resources out of the escript
+	%% 设置脚本文件的路径(即得到bootstrap的绝对路径然后存储起来)
+    State1 = try
+                 ScriptName = filename:absname(escript:script_name()),
+                 %% Running with 'erl -s rebar3 main' still sets a name for some reason
+                 %% so verify it is a real file
+                 case filelib:is_regular(ScriptName) of
+                     true ->
+                         rebar_state:escript_path(State, ScriptName);
+                     false ->
+                         State
+                 end
+             catch
+                 _:_ ->
+                     State
+             end,
+
+    %% TODO: Do we need this still? I think it may still be used.
+    %% Initialize vsn cache
+    rebar_state:set(State1, vsn_cache, dict:new()).
+
+parse_args([]) ->
+    parse_args(["help"]);
+parse_args([H | Rest]) when H =:= "-h"
+                          ; H =:= "--help" ->
+    parse_args(["help" | Rest]);
+parse_args([H | Rest]) when H =:= "-v"
+                          ; H =:= "--version" ->
+    parse_args(["version" | Rest]);
+parse_args([Task | RawRest]) ->
+    {list_to_atom(Task), RawRest}.
+
+set_options(State, {Options, NonOptArgs}) ->
+    GlobalDefines = proplists:get_all_values(defines, Options),
+
+    State1 = rebar_state:set(State, defines, GlobalDefines),
+
+    %% Set global variables based on getopt options
+    State2 = set_global_flag(State1, Options, force),
+
+    Task = proplists:get_value(task, Options, "help"),
+
+    {rebar_state:set(State2, task, Task), NonOptArgs}.
+
+%%
+%% get log level based on getopt option
+%%
+%% 获得日志等级
+log_level() ->
+    case os:getenv("QUIET") of
+        Q when Q == false; Q == "" ->
+            DefaultLevel = rebar_log:default_level(),
+            case os:getenv("DEBUG") of
+                D when D == false; D == "" ->
+                    DefaultLevel;
+                _ ->
+                    DefaultLevel + 3
+            end;
+         _ ->
+            rebar_log:error_level()
+    end.
+
+%%
+%% show version information and halt
+%%
+version() ->
+    {ok, Vsn} = application:get_key(rebar, vsn),
+    ?CONSOLE("rebar ~s on Erlang/OTP ~s Erts ~s",
+             [Vsn, erlang:system_info(otp_release), erlang:system_info(version)]).
+
+%% TODO: Actually make it 'global'
+%%
+%% set global flag based on getopt option boolean value
+%%
+set_global_flag(State, Options, Flag) ->
+    Value = case proplists:get_bool(Flag, Options) of
+                true ->
+                    "1";
+                false ->
+                    "0"
+            end,
+    rebar_state:set(State, Flag, Value).
+
+%%
+%% options accepted via getopt
+%%
+global_option_spec_list() ->
+    [
+    %% {Name,  ShortOpt,  LongOpt,    ArgSpec,   HelpMsg}
+    {help,     $h,        "help",     undefined, "Print this help."},
+    {version,  $v,        "version",  undefined, "Show version information."},
+    {task,     undefined, undefined,  string,    "Task to run."}
+    ].
+
+handle_error(rebar_abort) ->
+    erlang:halt(1);
+handle_error({error, rebar_abort}) ->
+    erlang:halt(1);
+handle_error({error, {Module, Reason}}) ->
+    case code:which(Module) of
+        non_existing ->
+            ?CRASHDUMP("~p: ~p~n~p~n~n", [Module, Reason, erlang:get_stacktrace()]),
+            ?ERROR("Uncaught error in rebar_core. Run with DEBUG=1 to stacktrace or consult rebar3.crashdump", []),
+            ?DEBUG("Uncaught error: ~p ~p", [Module, Reason]),
+            ?INFO("When submitting a bug report, please include the output of `rebar3 report \"your command\"`", []);
+        _ ->
+            ?ERROR("~s", [Module:format_error(Reason)])
+    end,
+    erlang:halt(1);
+handle_error({error, Error}) when is_list(Error) ->
+    ?ERROR("~s", [Error]),
+    erlang:halt(1);
+handle_error(Error) ->
+    %% Nothing should percolate up from rebar_core;
+    %% Dump this error to console
+    ?CRASHDUMP("Error: ~p~n~p~n~n", [Error, erlang:get_stacktrace()]),
+    ?ERROR("Uncaught error in rebar_core. Run with DEBUG=1 to see stacktrace or consult rebar3.crashdump", []),
+    ?DEBUG("Uncaught error: ~p", [Error]),
+    case erlang:get_stacktrace() of
+        [] -> ok;
+        Trace ->
+            ?DEBUG("Stack trace to the error location: ~p", [Trace])
+    end,
+    ?INFO("When submitting a bug report, please include the output of `rebar3 report \"your command\"`", []),
+    erlang:halt(1).
+
+%% 加载相应的应用
+start_and_load_apps(Caller) ->
+    _ = application:load(rebar),
+    %% Make sure crypto is running
+    ensure_running(crypto, Caller),
+    ensure_running(asn1, Caller),
+    ensure_running(public_key, Caller),
+    ensure_running(ssl, Caller),
+    inets:start(),
+    inets:start(httpc, [{profile, rebar}]).
+
+ensure_running(App, Caller) ->
+    case application:start(App) of
+        ok -> ok;
+        {error, {already_started, App}} -> ok;
+        {error, Reason} ->
+            %% These errors keep rebar3's own configuration to be loaded,
+            %% which disables the log level and causes a failure without
+            %% showing the error message. Bypass this entirely by overriding
+            %% the default value (which allows logging to take place)
+            %% and shut things down manually.
+            Log = ec_cmd_log:new(warn, Caller),
+            ec_cmd_log:error(Log, "Rebar dependency ~p could not be loaded "
+                                  "for reason ~p~n", [App, Reason]),
+            throw(rebar_abort)
+    end.
+
+%% genuine全局rebar.config文件和Config数据组装rebar_state数据结构
+state_from_global_config(Config, GlobalConfigFile) ->
+    rebar_utils:set_httpc_options(),
+	%% 将全局的rebar.config文件中的配置信息读取出来
+    GlobalConfigTerms = rebar_config:consult_file(GlobalConfigFile),
+	%% 根据GlobalConfigTerms配置信息创建rebar_state数据结构
+    GlobalConfig = rebar_state:new(GlobalConfigTerms),
+
+    %% We don't want to worry about global plugin install state effecting later
+    %% usage. So we throw away the global profile state used for plugin install.
+    GlobalConfigThrowAway = rebar_state:current_profiles(GlobalConfig, [global]),
+    GlobalState = case rebar_state:get(GlobalConfigThrowAway, plugins, []) of
+                      [] ->
+                          GlobalConfigThrowAway;
+                      GlobalPluginsToInstall ->
+                          rebar_plugins:handle_plugins(global,
+                                                       GlobalPluginsToInstall,
+                                                       GlobalConfigThrowAway)
+                  end,
+    GlobalPlugins = rebar_state:providers(GlobalState),
+    GlobalConfig2 = rebar_state:set(GlobalConfig, plugins, []),
+    GlobalConfig3 = rebar_state:set(GlobalConfig2, {plugins, global}, rebar_state:get(GlobalConfigThrowAway, plugins, [])),
+    rebar_state:providers(rebar_state:new(GlobalConfig3, Config), GlobalPlugins).
+
+test_state(State) ->
+    ErlOpts = rebar_state:get(State, erl_opts, []),
+    TestOpts = safe_define_test_macro(ErlOpts),
+    [{extra_src_dirs, ["test"]}, {erl_opts, TestOpts}].
+
+safe_define_test_macro(Opts) ->
+    %% defining a compile macro twice results in an exception so
+    %% make sure 'TEST' is only defined once
+    case test_defined(Opts) of
+       true  -> [];
+       false -> [{d, 'TEST'}]
+    end.
+
+test_defined([{d, 'TEST'}|_]) -> true;
+test_defined([{d, 'TEST', true}|_]) -> true;
+test_defined([_|Rest]) -> test_defined(Rest);
+test_defined([]) -> false.
